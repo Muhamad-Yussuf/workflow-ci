@@ -1,0 +1,167 @@
+name: Reusable - Update .env on VM
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        required: true
+        type: string
+        default: dev
+        description: "Target environment (dev|prod)"
+      customer:
+        required: true
+        type: string
+        default: all
+        description: "Customer domain or 'all'"
+      app:
+        required: true
+        type: string
+      project_dev:
+        required: true
+        type: string
+      project_prod:
+        required: true
+        type: string
+      service_account_dev:
+        required: true
+        type: string
+      service_account_prod:
+        required: true
+        type: string
+      vm_dev:
+        required: true
+        type: string
+      vm_prod:
+        required: true
+        type: string
+      zone_dev:
+        required: true
+        type: string
+      zone_prod:
+        required: true
+        type: string
+      app_path_dev:
+        required: true
+        type: string
+      app_path_prod:
+        required: true
+        type: string
+      wif_provider_dev:
+        required: false
+        type: string
+        default: ""
+      wif_provider_prod:
+        required: false
+        type: string
+        default: ""
+      customers_list:
+        required: false
+        type: string
+        default: "all,scy.org.sa,masriftech.com"
+        description: "Comma-separated allowed customers (for validation only)"
+    secrets:
+      GCP_WIF_PROVIDER:
+        required: false
+      GCP_WIF_PROVIDER_PROD:
+        required: false
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  update-env:
+    runs-on: ubuntu-latest
+
+    env:
+      APP:             ${{ inputs.app }}
+      ENV:             ${{ inputs.environment }}
+      GCP_PROJECT:     ${{ inputs.environment == 'prod' && inputs.project_prod || inputs.project_dev }}
+      SERVICE_ACCOUNT: ${{ inputs.environment == 'prod' && inputs.service_account_prod || inputs.service_account_dev }}
+      VM_NAME:         ${{ inputs.environment == 'prod' && inputs.vm_prod || inputs.vm_dev }}
+      ZONE:            ${{ inputs.environment == 'prod' && inputs.zone_prod || inputs.zone_dev }}
+      APP_PATH:        ${{ inputs.environment == 'prod' && inputs.app_path_prod || inputs.app_path_dev }}
+      WIF_PROVIDER:    ${{ inputs.environment == 'prod' && (inputs.wif_provider_prod != '' && inputs.wif_provider_prod || secrets.GCP_WIF_PROVIDER_PROD) || (inputs.wif_provider_dev != '' && inputs.wif_provider_dev || secrets.GCP_WIF_PROVIDER) }}
+
+    steps:
+      - id: auth
+        name: Authenticate to GCP (WIF preferred)
+        uses: google-github-actions/auth@v2
+        with:
+          project_id: ${{ env.GCP_PROJECT }}
+          service_account: ${{ env.SERVICE_ACCOUNT }}
+          workload_identity_provider: ${{ env.WIF_PROVIDER }}
+          access_token_scopes: https://www.googleapis.com/auth/cloud-platform
+          create_credentials_file: true
+          token_format: access_token
+
+      - name: Setup gcloud CLI
+        uses: google-github-actions/setup-gcloud@v1
+        with:
+          project_id: ${{ env.GCP_PROJECT }}
+          skip_install: true
+
+      - name: Generate temporary SSH key
+        run: ssh-keygen -t rsa -b 2048 -f ~/.ssh/temp_rsa -N ""
+
+      - name: Add SSH key via OS Login (TTL 5m)
+        run: |
+          gcloud compute os-login ssh-keys add \
+            --key-file=/home/runner/.ssh/temp_rsa.pub \
+            --impersonate-service-account="${{ env.SERVICE_ACCOUNT }}" \
+            --ttl=5m \
+            --project="${{ env.GCP_PROJECT }}" \
+            --quiet --format='none'
+
+      - name: Validate customer selection
+        run: |
+          IFS=',' read -ra ALLOWED <<< "${{ inputs.customers_list }}"
+          WANT="${{ inputs.customer }}"
+          for c in "${ALLOWED[@]}"; do
+            [ "$c" = "$WANT" ] && exit 0
+          done
+          echo "Customer '$WANT' not in allowed list: ${{ inputs.customers_list }}" >&2
+          exit 1
+
+      - name: Update ALL customers
+        if: ${{ inputs.customer == 'all' }}
+        run: |
+          gcloud compute ssh ${VM_NAME} \
+            --zone="${ZONE}" \
+            --ssh-key-file=~/.ssh/temp_rsa \
+            --tunnel-through-iap \
+            --impersonate-service-account="${SERVICE_ACCOUNT}" \
+            --command "sudo su ubuntu -c \"bash -s\"" <<'EOF'
+          set -e
+          BASE="${APP_PATH}/${APP}"
+          for dir in "$BASE"/*; do
+            [ -d "$dir" ] || continue
+            C=$(basename "$dir")
+            SFX=${C//./-}
+            SECRET_NAME="${APP}-${SFX}"
+            TARGET_DIR="$dir/conf/project/app"
+            mkdir -p "$TARGET_DIR"
+            gcloud secrets versions access latest --secret="$SECRET_NAME" | tee "$TARGET_DIR/.env" >/dev/null
+            cd "$dir" && docker compose up -d --force-recreate app
+          done
+          EOF
+
+      - name: Update ONE customer
+        if: ${{ inputs.customer != 'all' }}
+        run: |
+          CUSTOMER="${{ inputs.customer }}"
+          gcloud compute ssh ${VM_NAME} \
+            --zone="${ZONE}" \
+            --ssh-key-file=~/.ssh/temp_rsa \
+            --tunnel-through-iap \
+            --impersonate-service-account="${SERVICE_ACCOUNT}" \
+            --command "sudo su ubuntu -c \"bash -s\"" <<'EOF'
+          set -e
+          BASE="${APP_PATH}/${APP}"
+          C="${CUSTOMER}"
+          SFX=${C//./-}
+          SECRET_NAME="${APP}-${SFX}"
+          TARGET_DIR="$BASE/$C/conf/project/app"
+          mkdir -p "$TARGET_DIR"
+          gcloud secrets versions access latest --secret="$SECRET_NAME" | tee "$TARGET_DIR/.env" >/dev/null
+          cd "$BASE/$C" && docker compose up -d --force-recreate app
+          EOF

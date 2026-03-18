@@ -1,0 +1,161 @@
+name: Reusable - Update .env on VM (generic)
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        required: true
+        type: string
+        description: "dev or prod"
+        default: dev
+      app:
+        required: true
+        type: string
+      secret_name:
+        required: false
+        type: string
+        description: "Secret name (defaults to the app name)"
+      project_dev:
+        required: true
+        type: string
+      project_prod:
+        required: true
+        type: string
+      service_account_dev:
+        required: true
+        type: string
+      service_account_prod:
+        required: true
+        type: string
+      vm_dev:
+        required: true
+        type: string
+      vm_prod:
+        required: true
+        type: string
+      zone_dev:
+        required: true
+        type: string
+      zone_prod:
+        required: true
+        type: string
+      app_path_dev:
+        required: true
+        type: string
+      app_path_prod:
+        required: true
+        type: string
+      env_file_path_dev:
+        required: false
+        type: string
+        default: ""
+      env_file_path_prod:
+        required: false
+        type: string
+        default: ""
+      deploy_dir_dev:
+        required: false
+        type: string
+      deploy_dir_prod:
+        required: false
+        type: string
+      compose_service:
+        required: false
+        type: string
+        default: app
+      wif_provider_dev:
+        required: false
+        type: string
+        default: ""
+      wif_provider_prod:
+        required: false
+        type: string
+        default: ""
+      post_deploy_command:
+        required: false
+        type: string
+        description: "Command to run after secrets are installed (run from deploy_dir)"
+    secrets:
+      GCP_WIF_PROVIDER:
+        required: false
+      GCP_WIF_PROVIDER_PROD:
+        required: false
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  update-env:
+    runs-on: ubuntu-latest
+
+    env:
+      ENVIRONMENT: ${{ inputs.environment }}
+      APP: ${{ inputs.app }}
+      GCP_PROJECT: ${{ inputs.environment == 'prod' && inputs.project_prod || inputs.project_dev }}
+      SERVICE_ACCOUNT: ${{ inputs.environment == 'prod' && inputs.service_account_prod || inputs.service_account_dev }}
+      VM_NAME: ${{ inputs.environment == 'prod' && inputs.vm_prod || inputs.vm_dev }}
+      ZONE: ${{ inputs.environment == 'prod' && inputs.zone_prod || inputs.zone_dev }}
+      SECRET_NAME: ${{ inputs.secret_name != '' && inputs.secret_name || inputs.app }}
+      COMPOSE_SERVICE: ${{ inputs.compose_service }}
+      WIF_PROVIDER: ${{ inputs.environment == 'prod' && (inputs.wif_provider_prod != '' && inputs.wif_provider_prod || secrets.GCP_WIF_PROVIDER_PROD) || (inputs.wif_provider_dev != '' && inputs.wif_provider_dev || secrets.GCP_WIF_PROVIDER) }}
+      APP_PATH_DEV: ${{ inputs.app_path_dev }}
+      APP_PATH_PROD: ${{ inputs.app_path_prod }}
+      DEPLOY_DIR_DEV: ${{ inputs.deploy_dir_dev }}
+      DEPLOY_DIR_PROD: ${{ inputs.deploy_dir_prod }}
+      ENV_FILE_PATH_DEV: ${{ inputs.env_file_path_dev }}
+      ENV_FILE_PATH_PROD: ${{ inputs.env_file_path_prod }}
+
+    steps:
+      - id: auth
+        name: Authenticate to GCP (WIF only)
+        uses: google-github-actions/auth@v2
+        with:
+          project_id: ${{ env.GCP_PROJECT }}
+          service_account: ${{ env.SERVICE_ACCOUNT }}
+          workload_identity_provider: ${{ env.WIF_PROVIDER }}
+          access_token_scopes: https://www.googleapis.com/auth/cloud-platform
+          create_credentials_file: true
+          token_format: access_token
+
+      - name: Setup gcloud CLI
+        uses: google-github-actions/setup-gcloud@v1
+        with:
+          project_id: ${{ env.GCP_PROJECT }}
+          skip_install: true
+
+      - name: Generate temporary SSH key
+        run: ssh-keygen -t rsa -b 2048 -f ~/.ssh/temp_rsa -N ""
+
+      - name: Add SSH key via OS Login (TTL 5m)
+        run: |
+          gcloud compute os-login ssh-keys add \
+            --key-file=/home/runner/.ssh/temp_rsa.pub \
+            --impersonate-service-account="${{ env.SERVICE_ACCOUNT }}" \
+            --ttl=5m \
+            --project="${{ env.GCP_PROJECT }}" \
+            --quiet --format='none'
+
+      - name: Update .env on VM and deploy
+        run: |
+          set -euo pipefail
+          SECRET_NAME="${{ env.SECRET_NAME }}"
+          if [ "${ENVIRONMENT}" = "prod" ]; then
+            DEPLOY_DIR="${DEPLOY_DIR_PROD:-${APP_PATH_PROD}/${APP}}"
+            ENV_FILE="${ENV_FILE_PATH_PROD:-${APP_PATH_PROD}/${APP}/conf/project/app/.env}"
+          else
+            DEPLOY_DIR="${DEPLOY_DIR_DEV:-${APP_PATH_DEV}/${APP}}"
+            ENV_FILE="${ENV_FILE_PATH_DEV:-${APP_PATH_DEV}/${APP}/conf/project/app/.env}"
+          fi
+          POST_COMMAND="${{ inputs.post_deploy_command != '' && inputs.post_deploy_command || format('docker compose up -d --force-recreate {0}', inputs.compose_service) }}"
+          gcloud compute ssh ${VM_NAME} \
+            --zone="${ZONE}" \
+            --ssh-key-file=~/.ssh/temp_rsa \
+            --tunnel-through-iap \
+            --impersonate-service-account="${SERVICE_ACCOUNT}" \
+            --command "sudo su ubuntu -c \"bash -s\"" <<EOF
+          set -e
+          gcloud secrets versions access latest --secret="$SECRET_NAME" | tee "$ENV_FILE" >/dev/null
+          cd "$DEPLOY_DIR"
+          $POST_COMMAND
+          EOF

@@ -1,0 +1,117 @@
+name: Reusable - Deploy to GCE via Compose
+
+on:
+  workflow_call:
+    inputs:
+      gcp_project:
+        required: true
+        type: string
+      zone:
+        required: true
+        type: string
+      instance:
+        required: true
+        type: string
+      service_account:
+        required: true
+        type: string
+      deploy_path:
+        required: true
+        type: string
+        description: "Path on VM that contains docker-compose and .env"
+      env_var_name:
+        required: true
+        type: string
+        description: "Env var key in .env that holds the image tag"
+      image_tag:
+        required: true
+        type: string
+        description: "Full image tag to deploy (from build job output)"
+      short_sha:
+        required: false
+        type: string
+        default: ""
+      compose_service:
+        required: true
+        type: string
+      wif_provider:
+        required: false
+        type: string
+    secrets:
+      GCP_WIF_PROVIDER:
+        required: false
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - id: auth
+        name: Auth to GCP via OIDC
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ inputs.wif_provider != '' && inputs.wif_provider || secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ inputs.service_account }}
+          project_id: ${{ inputs.gcp_project }}
+          access_token_scopes: https://www.googleapis.com/auth/cloud-platform
+          create_credentials_file: true
+          token_format: access_token
+
+      - name: Setup gcloud (preinstalled)
+        uses: google-github-actions/setup-gcloud@v1
+        with:
+          project_id: ${{ inputs.gcp_project }}
+          skip_install: true
+
+      - name: Generate temporary SSH key
+        run: ssh-keygen -t rsa -b 2048 -f ~/.ssh/temp_rsa -N ""
+
+      - name: Add OS Login SSH key (5m TTL)
+        run: |
+          gcloud compute os-login ssh-keys add \
+            --key-file=/home/runner/.ssh/temp_rsa.pub \
+            --impersonate-service-account=${{ inputs.service_account }} \
+            --ttl=5m \
+            --quiet \
+            --format='none' \
+            --project=${{ inputs.gcp_project }}
+
+      - name: Deploy via SSH
+        run: |
+          # Sanitize tag (strip whitespace/newlines)
+          TAG="$(printf '%s' "${{ inputs.image_tag }}" | tr -d '\r\n' | xargs)"
+          SHORT="$(printf '%s' "${{ inputs.short_sha }}" | tr -d '\r\n' | xargs)"
+          if [ -z "$TAG" ]; then
+            echo "Image tag empty"; exit 1
+          fi
+          if [ -z "$SHORT" ]; then
+            # fallback to last segment of the image tag
+            SHORT="${TAG##*:}"
+          fi
+          echo "Deploying image: $TAG (env tag: $SHORT)"
+          gcloud compute ssh "${{ inputs.instance }}" \
+            --zone="${{ inputs.zone }}" \
+            --tunnel-through-iap \
+            --impersonate-service-account=${{ inputs.service_account }} \
+            --ssh-key-file=~/.ssh/temp_rsa \
+            --command="sudo su ubuntu -c '\
+              cd ${{
+                inputs.deploy_path
+              }} && \
+              sed -i \"s|^${{ inputs.env_var_name }}=.*|${{ inputs.env_var_name }}=${SHORT}|\" .env && \
+              ${{
+                inputs.env_var_name
+              }}=${SHORT} docker compose pull ${{ inputs.compose_service }} && \
+              ${{
+                inputs.env_var_name
+              }}=${SHORT} docker compose up -d --force-recreate ${{ inputs.compose_service }} && \
+              docker image prune -f \
+            '"
